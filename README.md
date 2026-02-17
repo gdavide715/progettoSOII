@@ -1,2 +1,0 @@
-# progettoSOII
-prova commit
