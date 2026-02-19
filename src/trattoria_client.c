@@ -5,16 +5,30 @@
 #include <sys/msg.h>
 #include <unistd.h>
 #include <sys/sem.h>
+#include <pthread.h>
+#include <sys/shm.h>
 
 #include "ipc.h"
 
-void toggle_blackboard(int semid, int op){      //-1 blocca, 1 Sblocca
+//struttura dati per i thread personale
+typedef struct{
+    int id;
+    int semid;
+    shm_diningroom_t *sala;
+    shm_blackboard_t *lavagna;
+    shm_cashdesk_t *cassa;
+    shm_kitchen_t *cucina;
+    strategy_t strategia;
+} thread_args_t;
+
+void toggle_blackboard(int semid, int op){      //-1 blocca, 1 sblocca
     struct sembuf sops = { .sem_num = SEMIDX_BLACKBOARD, .sem_op=op, .sem_flg=0};
     semop(semid, &sops, 1);
 }
 
 void* staff_worker(void* arg){
-    int my_id = *(int*)arg;
+    thread_args_t *data = (thread_args_t*)arg;
+    int my_id = data->id;
     int q_fatigue = msgget(ftok(TRATTORIA_FTOK_PATH, PROJ_MSG_FATIGUE), 0666);
     msg_fatigue_t fatigue_msg;
 
@@ -23,11 +37,54 @@ void* staff_worker(void* arg){
             printf("[Staff %d] Nuova stanchezza nel ruolo %d: livello %d\n", my_id, fatigue_msg.role, fatigue_msg.new_lvl);
         }
 
-        toggle_blackboard(semid, -1);
         //azione da fare mentre il semaforo è bloccato (pulire tavolo, prendere ordine, cambio ruolo,...)
-        //non so come gestire semid, devo passarlo come parametro??? devo fare una struttura esterna???
+        toggle_blackboard(data->semid, -1);
 
-        toggle_blackboard(semid, 1);
+        //rilascio cassiere
+        if(data->cassa->pending_payments == 0 && data->lavagna->cashier == data->id){
+            data->lavagna->cashier = -1;
+        }
+
+        //rilascio lavapiatti
+        if(data->lavagna->dishwasher == data->id && data->cucina->dirty_plates == LVL_NONE){
+            data->lavagna->dishwasher=-1;
+        }
+
+        //rilascio cuoco
+        if(data->lavagna->cook == data->id && data->cucina->pending_orders == 0){
+            data->lavagna->cook=-1;
+        }
+
+        //pulizia tavoli (se tavolo è FREED metto cleaner)
+        for(int i=0; i<data->sala->tables_n; i++){
+            if(data->sala->tables[i].state == TABLE_FREED && data->lavagna->tables[i].cleaner==-1){
+                data->lavagna->tables[i].cleaner = my_id;
+            }
+        }
+
+        //pagamento (se ci sono pagamenti in cassa)
+        if(data->cassa->pending_payments > 0 && data->lavagna->cashier == -1){
+            data->lavagna->cashier = my_id;
+        }
+
+        //ordine (se tavolo è TAKEN metto un waiter)
+        for(int i=0; i<data->sala->tables_n; i++){
+            if(data->sala->tables[i].state ==  TABLE_TAKEN && data->lavagna->tables[i].waiter==-1){
+                data->lavagna->tables[i].waiter = my_id;
+            }
+        }
+
+        //lavaggio piatti (se ci sono piatti sporchi e nessuno sta lavando)
+        if(data->cucina->dirty_plates != LVL_NONE && data->lavagna->dishwasher == -1){
+            data->lavagna->dishwasher = my_id;
+        }
+
+        //cucina (se ci sono ordini in cucina)
+        if(data->cucina->pending_orders > 0 && data->lavagna->cook == -1){
+            data->lavagna->cook = my_id;
+        }
+
+        toggle_blackboard(data->semid, 1);
 
         usleep(10000);
         
@@ -53,6 +110,19 @@ int main(int argc, char *argv[]) {
     key_t key_s2c = ftok(TRATTORIA_FTOK_PATH, PROJ_MSG_S2C);
     int msqid_c2s = msgget(key_c2s, 0666);
     int msqid_s2c = msgget(key_s2c, 0666);
+
+    //chiavi memorie condivise
+    int shm_dr_id = shmget(ftok(TRATTORIA_FTOK_PATH, PROJ_DININGROOM), sizeof(shm_diningroom_t), 0666);
+    int shm_ki_id = shmget(ftok(TRATTORIA_FTOK_PATH, PROJ_KITCHEN), sizeof(shm_kitchen_t), 0666);
+    int shm_bb_id = shmget(ftok(TRATTORIA_FTOK_PATH, PROJ_BLACKBOARD), sizeof(shm_blackboard_t), 0666);
+    int shm_cd_id = shmget(ftok(TRATTORIA_FTOK_PATH, PROJ_CASHDESK), sizeof(shm_cashdesk_t), 0666);
+    int semid = semget(ftok(TRATTORIA_FTOK_PATH, PROJ_SEM), SEM_NSEMS, 0666);
+
+    //puntatori alle strutture
+    shm_diningroom_t *sala = shmat(shm_dr_id, NULL, 0);
+    shm_kitchen_t *cucina = shmat(shm_ki_id, NULL, 0);
+    shm_cashdesk_t *cassa = shmat(shm_cd_id, NULL, 0);
+    shm_blackboard_t *lavagna = shmat(shm_bb_id, NULL, 0);
 
     if (msqid_c2s == -1 || msqid_s2c == -1) {
         perror("Errore connessione code (il server è attivo?)");
@@ -116,18 +186,35 @@ int main(int argc, char *argv[]) {
       }
     }
 
-    //chiavi memorie condivise
-    int shm_dr_id = shmget(ftok(TRATTORIA_FTOK_PATH, PROJ_DININGROOM), sizeof(shm_diningroom_t), 0666);
-    int shm_ki_id = shmget(ftok(TRATTORIA_FTOK_PATH, PROJ_KITCHEN), sizeof(shm_kitchen_t), 0666);
-    int shm_bb_id = shmget(ftok(TRATTORIA_FTOK_PATH, PROJ_BLACKBOARD), sizeof(shm_blackboard_t), 0666);
-    int shm_cd_id = shmget(ftok(TRATTORIA_FTOK_PATH, PROJ_CASHDESK), sizeof(shm_cashdesk_t), 0666);
-    int semid = semget(ftok(TRATTORIA_FTOK_PATH, PROJ_SEM), SEM_NSEMS, 0666);
+    //gestione istanze
+    while(1){
+        msg_instance_t inst;
+        if(msgrcv(msqid_s2c, &inst, sizeof(msg_instance_t)-sizeof(long), 0, 0) == -1)
+            break;
+        if(inst.mtype == MSGTYPE_END) break;
 
-    //puntatori alle strutture
-    shm_diningroom_t *sala = shmat(shm_dr_id, NULL, 0);
-    shm_kitchen_t *cucina = shmat(shm_ki_id, NULL, 0);
-    shm_cashdesk_t *cassa = shmat(shm_cd_id, NULL, 0);
-    shm_blackboard_t *lavagna = shmat(shm_bb_id, NULL, 0);
+        if(inst.mtype == MSGTYPE_INSTANCE){
+            printf("Avvio Istanza %d (%d famiglie)\n", inst.instance_id, inst.families_n);
+            pthread_t threads[MAX_STAFF];
+            thread_args_t t_args[MAX_STAFF];
+
+            for(int i=0; i<buffer.welcome.staff_n; i++){
+                t_args[i] = (thread_args_t){.id = i, .semid=semid, .sala=sala, .cucina=cucina,
+                            .lavagna=lavagna, .cassa=cassa, .strategia=inst.strategy};
+                pthread_create(&threads[i], NULL, staff_worker, &t_args[i]);
+            }
+
+            msg_instance_done_t done;
+            msgrcv(msqid_s2c, &done, sizeof(msg_instance_done_t)-sizeof(long), MSGTYPE_INSTANCE_DONE, 0);
+            printf("Instanza completata. Risultato: %s\n", done.average_families_score_review);
+
+            for(int i=0; i<buffer.welcome.staff_n; i++)
+                pthread_cancel(threads[i]);
+        }
+    }
+
+    //distacco memorie condivise
+    shmdt(sala); shmdt(cucina); shmdt(lavagna); shmdt(cassa);
 
     return 0;
 }

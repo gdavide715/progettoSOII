@@ -4,3 +4,9 @@
 non so come gestire semid, il semaforo che deve bloccare per fare un'azione atomica
 al lavoratore)
 - ho aggiunto le chiavi alle memorie condivise e i puntatori alle strutture
+
+19/02 Picci:
+- ho sistemato staff_worker
+- ho aggiunto una struttura thread_args_t per i dati del personale
+- nel main ho messo un while che gestisce le istanze
+- l'esecuzione del server si blocca al momento del pagamento
