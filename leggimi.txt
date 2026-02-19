@@ -1,0 +1,6 @@
+18/02 Picci:
+- ho aggiunto la funzione toggle_blackboard per bloccare/sbloccare semaforo
+- ho aggiunto la funzione staff_worker che gestisce un lavoratore (c'è un errore,
+non so come gestire semid, il semaforo che deve bloccare per fare un'azione atomica
+al lavoratore)
+- ho aggiunto le chiavi alle memorie condivise e i puntatori alle strutture
