@@ -10,3 +10,15 @@ al lavoratore)
 - ho aggiunto una struttura thread_args_t per i dati del personale
 - nel main ho messo un while che gestisce le istanze
 - l'esecuzione del server si blocca al momento del pagamento
+
+24/02 Thomas:
+- ho aggiunta staff_member_t a thread_args_t e l'ho popolato nel main per permettere a ogni thread 
+di conoscere le proprie skill.
+- ho introdotto la variabile my_role. Un membro dello staff ora accetta un nuovo compito solo se è 
+in stato ROLE_NONE, evitando che un singolo thread si assegni a più ruoli contemporaneamente sulla lavagna.
+- in Reputazione, il thread sceglie il ruolo se ha la skill necessaria o se c'è un'emergenza 
+(es. troppi ordini pendenti, troppi tavoli sporchi ecc.).
+- in Profitto, ho stabilito una gerarchia fissa per massimizzare il turnover: 
+Pulizia > Cassa > Ordini > Cucina > Lavapiatti.
+- ho aggiunto i rilasci del cleaner e del cameriere. Ora il cleaner si libera non appena il tavolo è pulito
+e il cameriere si libera dopo l'ordine finché il cibo non è pronto così può svolgere altri compiti
