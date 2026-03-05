@@ -20,12 +20,65 @@ typedef struct{
     shm_kitchen_t *cucina;
     strategy_t strategia;
     staff_member_t *member;
+    staff_member_t *allMembers;
+    int staff_n;
     volatile sig_atomic_t *stop;
 } thread_args_t;
 
 void toggle_blackboard(int semid, int op){ //-1 blocca, 1 sblocca
     struct sembuf sops = { .sem_num = SEMIDX_BLACKBOARD, .sem_op=op, .sem_flg=0};
     semop(semid, &sops, 1);
+}
+
+int calcola_punteggio(staff_member_t membro, role_t ruolo, strategy_t strategia){
+    int valore_traits, valore_skills;
+    if(ruolo == ROLE_WAITER){
+        valore_traits = membro.traits[TRAIT_PATIENCE] + membro.traits[TRAIT_PROFESSIONALITY];
+        valore_skills = membro.skills[SKILL_WAITER];
+    }
+    else if(ruolo == ROLE_CASHIER){
+        valore_traits = membro.traits[TRAIT_SOCIABILITY];
+        valore_skills = membro.skills[SKILL_CASHIER];
+    }
+    else if(ruolo == ROLE_COOK){
+        valore_traits = membro.traits[TRAIT_PROFESSIONALITY];
+        valore_skills = membro.skills[SKILL_COOK];
+    }
+    else{
+        valore_traits = 0;
+        valore_skills = membro.skills[SKILL_HELPER];
+    }
+
+    if(strategia == STRATEGY_REPUTATION){
+        return 2 * valore_traits + valore_skills;
+    }
+    else if(strategia == STRATEGY_PROFIT){
+        return 2 * valore_skills + valore_traits;
+    }
+    else{
+        return valore_skills + valore_traits;
+    }
+}
+
+int is_free(shm_blackboard_t *lavagna, int staff_id, int tables_n){
+    if(lavagna->cashier == staff_id){
+        return 0;
+    }
+    if(lavagna->cook == staff_id){
+        return 0;
+    }
+    if(lavagna->dishwasher == staff_id){
+        return 0;
+    }
+    for(int i = 0; i < tables_n; i++){
+        if(lavagna->tables[i].cleaner == staff_id){
+            return 0;
+        }
+        if(lavagna->tables[i].waiter == staff_id){
+            return 0;
+        }
+    }
+    return 1;
 }
 
 void* staff_worker(void* arg){
@@ -84,8 +137,18 @@ void* staff_worker(void* arg){
 
         //rilascio cuoco
         if(data->lavagna->cook == data->id && data->cucina->pending_orders == 0){
-            my_role = ROLE_NONE;
-            data->lavagna->cook=-1;
+            int flag = 0;
+            for(int i = 0; i < MAX_TABLES; i++){
+                if(data->sala->tables[i].state == TABLE_TAKEN && data->cucina->food_ready[i] == TR_FALSE &&
+                data->sala->tables[i].food_qty > 0){
+                    flag = 1;
+                    break;
+                }
+            }
+            if(!flag){
+                my_role = ROLE_NONE;
+                data->lavagna->cook=-1;
+            }
         }
 
         //rilascio cameriere
@@ -104,64 +167,23 @@ void* staff_worker(void* arg){
             }
         }
 
-        //conteggio del numero di tavoli FREED e TAKEN
-        int freed_tables = 0;
-        int taken_tables = 0;
-        for(int i=0; i<data->sala->tables_n; i++){
-            if(data->sala->tables[i].state == TABLE_FREED){
-                freed_tables++;
-            }
-            if(data->sala->tables[i].state == TABLE_TAKEN){
-                taken_tables++;
-            }
-        }
-
-        //pulizia tavoli (se tavolo è FREED metto cleaner)
-        if(my_role == ROLE_NONE){
-            for(int i=0; i<data->sala->tables_n; i++){
-                if(data->sala->tables[i].state == TABLE_FREED && data->lavagna->tables[i].cleaner==-1){
-                    if(data->strategia == STRATEGY_REPUTATION){
-                        if(data->member->skills[SKILL_HELPER] >= PARAM_MEDIUM || freed_tables > 4){
-                            data->lavagna->tables[i].cleaner = my_id;
-                            my_role = ROLE_HELPER;
-                            break;
-                        }
-                    } else{
-                        data->lavagna->tables[i].cleaner = my_id;
-                        my_role = ROLE_HELPER;
-                        break;
-                    }
-                }
-            }
-        }
-
-        //pagamento (se ci sono pagamenti in cassa)
-        if(my_role == ROLE_NONE){
-            if(data->cassa->pending_payments > 0 && data->lavagna->cashier == -1){
-                if(data->strategia == STRATEGY_REPUTATION){
-                    if(data->member->skills[SKILL_CASHIER] >= PARAM_MEDIUM || data->cassa->pending_payments > 4){
-                        data->lavagna->cashier = my_id;
-                        my_role = ROLE_CASHIER;
-                    }
-                } else{
-                    data->lavagna->cashier = my_id;
-                    my_role = ROLE_CASHIER;
-                }
-            }
-        }
-
         //ordine (se tavolo è TAKEN metto un waiter)
         if(my_role == ROLE_NONE){
             for(int i=0; i<data->sala->tables_n; i++){
                 if(data->lavagna->tables[i].waiter==-1 && ((data->sala->tables[i].state == TABLE_TAKEN && data->sala->tables[i].food_qty == LVL_NONE) || (data->sala->tables[i].food_qty > LVL_NONE && data->cucina->food_ready[i] == TR_TRUE))){
-                    if(data->strategia == STRATEGY_REPUTATION){
-                        if(data->member->skills[SKILL_WAITER] >= PARAM_MEDIUM || taken_tables > 4){
-                            data->lavagna->tables[i].waiter = my_id;
-                            my_role = ROLE_WAITER;
-                            break;
+                    int miglior_id = -1;
+                    int miglior_punteggio = -1;
+                    for(int j = 0; j < data->staff_n; j++){
+                        if(is_free(data->lavagna, j, data->lavagna->tables_n)){
+                            int punteggio = calcola_punteggio(data->allMembers[j], ROLE_WAITER, data->strategia);
+                            if(punteggio > miglior_punteggio){
+                                miglior_id = j;
+                                miglior_punteggio = punteggio;
+                            }
                         }
-                    } else{
-                        data->lavagna->tables[i].waiter = my_id;
+                    }
+                    if(miglior_id == data->id){
+                        data->lavagna-> tables[i].waiter = my_id;
                         my_role = ROLE_WAITER;
                         break;
                     }
@@ -172,14 +194,41 @@ void* staff_worker(void* arg){
         //cucina (se ci sono ordini in cucina)
         if(my_role == ROLE_NONE){
             if(data->cucina->pending_orders > 0 && data->lavagna->cook == -1){
-                if(data->strategia == STRATEGY_REPUTATION){
-                    if(data->member->skills[SKILL_COOK] >= PARAM_MEDIUM || data->cucina->pending_orders > 4){
-                        data->lavagna->cook = my_id;
-                        my_role = ROLE_COOK;
+                int miglior_id = -1;
+                int miglior_punteggio = -1;
+                for(int i = 0; i < data->staff_n; i++){
+                    if(is_free(data->lavagna, i, data->lavagna->tables_n)){
+                        int punteggio = calcola_punteggio(data->allMembers[i], ROLE_COOK, data->strategia);
+                        if(punteggio > miglior_punteggio){
+                            miglior_id = i;
+                            miglior_punteggio = punteggio;
+                        }
                     }
-                } else{
+                }
+                if(miglior_id == data->id){
                     data->lavagna->cook = my_id;
                     my_role = ROLE_COOK;
+                }
+            }
+        }
+
+        //pagamento (se ci sono pagamenti in cassa)
+        if(my_role == ROLE_NONE){
+            if(data->cassa->pending_payments > 0 && data->lavagna->cashier == -1){
+                int miglior_id = -1;
+                int miglior_punteggio = -1;
+                for(int i = 0; i < data->staff_n; i++){
+                    if(is_free(data->lavagna, i, data->lavagna->tables_n)){
+                        int punteggio = calcola_punteggio(data->allMembers[i], ROLE_CASHIER, data->strategia);
+                        if(punteggio > miglior_punteggio){
+                            miglior_id = i;
+                            miglior_punteggio = punteggio;
+                        }
+                    }
+                }
+                if(miglior_id == data->id){
+                    data->lavagna->cashier = my_id;
+                    my_role = ROLE_CASHIER;
                 }
             }
         }
@@ -187,14 +236,44 @@ void* staff_worker(void* arg){
         //lavaggio piatti (se ci sono piatti sporchi e nessuno sta lavando)
         if(my_role == ROLE_NONE){
             if(data->cucina->dirty_plates != LVL_NONE && data->lavagna->dishwasher == -1){
-                if(data->strategia == STRATEGY_REPUTATION){
-                    if(data->member->skills[SKILL_HELPER] >= PARAM_MEDIUM || data->cucina->dirty_plates == LVL_HIGH){
-                        data->lavagna->dishwasher = my_id;
-                        my_role = ROLE_DISHWASHER;
+                int miglior_id = -1;
+                int miglior_punteggio = -1;
+                for(int i = 0; i < data->staff_n; i++){
+                    if(is_free(data->lavagna, i, data->lavagna->tables_n)){
+                        int punteggio = calcola_punteggio(data->allMembers[i], ROLE_DISHWASHER, data->strategia);
+                        if(punteggio > miglior_punteggio){
+                            miglior_id = i;
+                            miglior_punteggio = punteggio;
+                        }
                     }
-                } else{
+                }
+                if(miglior_id == data->id){
                     data->lavagna->dishwasher = my_id;
                     my_role = ROLE_DISHWASHER;
+                }
+            }
+        }
+
+        //pulizia tavoli (se tavolo è FREED metto cleaner)
+        if(my_role == ROLE_NONE){
+            for(int i=0; i<data->sala->tables_n; i++){
+                if(data->sala->tables[i].state == TABLE_FREED && data->lavagna->tables[i].cleaner==-1){
+                    int miglior_id = -1;
+                    int miglior_punteggio = -1;
+                    for(int j = 0; j < data->staff_n; j++){
+                        if(is_free(data->lavagna, j, data->lavagna->tables_n)){
+                            int punteggio = calcola_punteggio(data->allMembers[j], ROLE_HELPER, data->strategia);
+                            if(punteggio > miglior_punteggio){
+                                miglior_id = j;
+                                miglior_punteggio = punteggio;
+                            }
+                        }
+                    }
+                    if(miglior_id == data->id){
+                        data->lavagna->tables[i].cleaner = my_id;
+                        my_role = ROLE_HELPER;
+                        break;
+                    }
                 }
             }
         }
@@ -326,6 +405,8 @@ int main(int argc, char *argv[]) {
                     .cassa = cassa,
                     .strategia = inst.strategy,
                     .member = &buffer.welcome.staff[i],
+                    .allMembers = &buffer.welcome.staff[0],
+                    .staff_n = buffer.welcome.staff_n,
                     .stop = &stop_instance
                 };
                 pthread_create(&threads[i], NULL, staff_worker, &t_args[i]);
