@@ -10,10 +10,13 @@
 
 #include "ipc.h"
 
+volatile int instance_running = 0;
+
 //struttura dati per i thread personale
 typedef struct{
     int id;
     int semid;
+    int speed;  
     shm_diningroom_t *sala;
     shm_blackboard_t *lavagna;
     shm_cashdesk_t *cassa;
@@ -27,97 +30,142 @@ void toggle_blackboard(int semid, int op){      //-1 blocca, 1 sblocca
     semop(semid, &sops, 1);
 }
 
-//azione che compie ogni membro dello staff
-void* staff_worker(void* arg){
-    thread_args_t *data = (thread_args_t*)arg;
-    int my_id = data->id;
-    int q_fatigue = msgget(ftok(TRATTORIA_FTOK_PATH, PROJ_MSG_FATIGUE), 0666);
-    msg_fatigue_t fatigue_msg;
+// ================================================================
+// STRATEGIA REPUTATION
+// Ruoli fissi: Giulia gestisce ordini per qualità massima
+// ================================================================
+void worker_reputation(thread_args_t *a) {
+    int id = a->id;
+    int n  = a->sala->tables_n;
 
-    //ogni membro continua a lavorare finché non viene fermato dal server
-    while(1){    
+    toggle_blackboard(a->semid, -1);
 
-        if(data->strategia == STRATEGY_REPUTATION){
-            switch(my_id){
-                case 0: 
-                //GIULIA: prende ordini e cucina (patience: 2 e professionalism: 2)
-                    
-                    // Entra nella sezione critica
-                    toggle_blackboard(data->semid, -1); 
-
-                    int tavolo_da_servire = -1;
-                    for (int i = 0; i < data->sala->tables_n; i++) {
-                        if (data->sala->tables[i].state == TABLE_TAKEN && 
-                            data->sala->tables[i].food_qty == LVL_NONE && 
-                            data->lavagna->tables[i].waiter == -1) {
-                            tavolo_da_servire = i;
-                            break;
-                        }
-                    }
-
-                    //se c'è un tavolo da servire serve altrimenti cucina
-                    if (tavolo_da_servire != -1) {
-                        // Trovato un tavolo.
-                        // my_id + 1 come mtype per ricevere solo i messaggi destinati a Giulia.
-                        msg_fatigue_t f_msg;
-                        
-                        // Tentiamo di leggere se c'è un aggiornamento sulla fatica da CAMERIERE (ROLE_WAITER)
-                        // Nota: msgrcv è non bloccante (IPC_NOWAIT)
-                        if (msgrcv(q_fatigue, &f_msg, sizeof(msg_fatigue_t) - sizeof(long), my_id + 1, IPC_NOWAIT) != -1) {
-                            
-                            if (f_msg.role == ROLE_WAITER && f_msg.new_lvl >= LVL_LOW) {
-                                // È stanca! Rilascia il lucchetto, dorme e ricomincia
-                                toggle_blackboard(data->semid, 1);
-                                printf("[GIULIA] Tavolo %d attende, ma leggo fatica ALTA. Riposo...\n", tavolo_da_servire);
-                                
-                                sleep(2); 
-                                // Giulia riproverà a leggere la coda.
-                                continue; 
-                            }
-                        }
-
-                        // Se non c'erano messaggi di fatica alta o la coda era vuota, serve il tavolo
-                        data->lavagna->tables[tavolo_da_servire].waiter = my_id;
-                        printf("[GIULIA] Prendo l'ordine al tavolo %d.\n", tavolo_da_servire);
-                    } else {
-                        // NESSUN ORDINE DA PRENDERE AI TAVOLI: Controlliamo la cucina
-                        if (data->cucina->pending_orders > 0 && data->lavagna->cook == -1) {
-                            
-                            // 1. Controllo fatica per il ruolo COOK
-                            msg_fatigue_t f_msg_cook;
-                            if (msgrcv(q_fatigue, &f_msg_cook, sizeof(msg_fatigue_t) - sizeof(long), my_id + 1, IPC_NOWAIT) != -1) {
-                                if (f_msg_cook.role == ROLE_COOK && f_msg_cook.new_lvl >= LVL_LOW) {
-                                    // Troppo stanca per cucinare
-                                    toggle_blackboard(data->semid, 1);
-                                    printf("[GIULIA] Ci sono ordini in cucina, ma leggo fatica ALTA (COOK). Riposo...\n");
-                                    sleep(2);
-                                    continue;
-                                }
-                            }
-
-                            // 2. Se non è stanca, si mette ai fornelli
-                            data->lavagna->cook = my_id;
-                            printf("[GIULIA] Non ci sono ordini ai tavoli. Vado in cucina (Professionalism: 2).\n");
-                        }
-                    }
-
-                    toggle_blackboard(data->semid, 1);
-                    usleep(10000);
-                    
-
-                break;
-                case 1://SARA: pulisce, lava piatti e serve
-                break;
-                case 2://FABIO: cassiere fisso + jolly(sociability: 1)
-                break;
-                case 3://GIORGIA: pulisce, lava piatti e serve (Giulia è più brava sia in cucina che come cameriera)
-                break;
-
+    switch (id) {
+        // -------------------------------------------------------
+        // Giulia (0): cuoca fissa + cameriera SOLO per prendere ordini
+        // -------------------------------------------------------
+        case 0:
+            if (a->lavagna->cook == -1)
+                a->lavagna->cook = id;
+            // Ordine da prendere: TABLE_TAKEN ma cibo NON ancora pronto
+            // (se food_ready il tavolo aspetta consegna, non ordine)
+            for (int i = 0; i < n; i++) {
+                if (a->sala->tables[i].state == TABLE_TAKEN &&
+                    !a->cucina->food_ready[i]              &&
+                    a->lavagna->tables[i].waiter == -1) {
+                    a->lavagna->tables[i].waiter = id;
+                    break;
+                }
             }
+            break;
+        // -------------------------------------------------------
+        // Sara (1): consegna cibo + pulizia tavoli + lavapiatti
+        // -------------------------------------------------------
+        case 1:
+            // Consegna cibo (priorità massima)
+            for (int i = 0; i < n; i++) {
+                if (a->cucina->food_ready[i] &&
+                    a->lavagna->tables[i].waiter == -1) {
+                    a->lavagna->tables[i].waiter = id;
+                    break;
+                }
+            }
+            // Pulizia: TABLE_FREED = famiglia uscita, tavolo sporco
+            for (int i = 0; i < n; i++) {
+                if (a->sala->tables[i].state == TABLE_FREED &&
+                    a->lavagna->tables[i].cleaner == -1) {
+                    a->lavagna->tables[i].cleaner = id;
+                    break;
+                }
+            }
+            // Lavapiatti
+            if (a->cucina->dirty_plates >= LVL_MED &&
+                a->lavagna->dishwasher == -1) {
+                a->lavagna->dishwasher = id;
+            }
+            break;
+        // -------------------------------------------------------
+        // Fabio (2): cassiere fisso + jolly pulizia/lavapiatti
+        // -------------------------------------------------------
+        case 2:
+            if (a->lavagna->cashier == -1)
+                a->lavagna->cashier = id;
+            // Jolly pulizia solo se TABLE_FREED
+            for (int i = 0; i < n; i++) {
+                if (a->sala->tables[i].state == TABLE_FREED &&
+                    a->lavagna->tables[i].cleaner == -1) {
+                    a->lavagna->tables[i].cleaner = id;
+                    break;
+                }
+            }
+            // Jolly lavapiatti solo in emergenza
+            if (a->cucina->dirty_plates >= LVL_HIGH &&
+                a->lavagna->dishwasher == -1) {
+                a->lavagna->dishwasher = id;
+            }
+            break;
+        // -------------------------------------------------------
+        // Giorgia (3): consegna cibo + pulizia tavoli + lavapiatti
+        // -------------------------------------------------------
+        case 3:
+            // Consegna cibo
+            for (int i = 0; i < n; i++) {
+                if (a->cucina->food_ready[i] &&
+                    a->lavagna->tables[i].waiter == -1) {
+                    a->lavagna->tables[i].waiter = id;
+                    break;
+                }
+            }
+            // Pulizia: TABLE_FREED
+            for (int i = 0; i < n; i++) {
+                if (a->sala->tables[i].state == TABLE_FREED &&
+                    a->lavagna->tables[i].cleaner == -1) {
+                    a->lavagna->tables[i].cleaner = id;
+                    break;
+                }
+            }
+            // Lavapiatti
+            if (a->cucina->dirty_plates >= LVL_MED &&
+                a->lavagna->dishwasher == -1) {
+                a->lavagna->dishwasher = id;
+            }
+            break;
+    }
 
-        } else if(data->strategia == STRATEGY_PROFIT){
-            //da implementare...
-        }
+    toggle_blackboard(a->semid, 1); // UNLOCK
+}
+
+// ================================================================
+// STRATEGIA PROFIT
+// Tutti prendono ordini e si coprono: nessuno idle, massimo throughput
+// ================================================================
+static void worker_profit(thread_args_t *a) {
+    int id = a->id;
+    int n  = a->sala->tables_n;
+
+    toggle_blackboard(a->semid, -1);
+
+    //DA IMPLEMENTARE
+
+    toggle_blackboard(a->semid, 1);
+}
+
+// ================================================================
+// DISPATCHER
+// ================================================================
+void *staff_worker(void *arg) {
+    thread_args_t *a = (thread_args_t *)arg;
+
+    int sleep_us = 10000 / (a->speed > 0 ? a->speed : 1);
+    if (sleep_us < 500) sleep_us = 500;
+
+    while (instance_running) {
+        if (a->strategia == STRATEGY_REPUTATION)
+            worker_reputation(a);
+        else
+            worker_profit(a);
+
+        usleep(sleep_us);
     }
 
     return NULL;
@@ -254,6 +302,7 @@ int main(int argc, char *argv[]) {
             t_args[i] = (thread_args_t){
                 .id        = i,
                 .semid     = semid,
+                .speed = ibuf.instance.speed,
                 .sala      = sala,
                 .cucina    = cucina,
                 .lavagna   = lavagna,
