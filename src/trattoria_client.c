@@ -148,7 +148,45 @@ static void worker_profit(thread_args_t *a) {
 
     toggle_blackboard(a->semid, -1);
 
-    //DA IMPLEMENTARE
+    /* Cassiere SEMPRE assegnato, come nella reputation */
+    if (a->lavagna->cashier == -1)
+        a->lavagna->cashier = id;
+
+    /* Cuoco SEMPRE assegnato */
+    if (a->lavagna->cook == -1)
+        a->lavagna->cook = id;
+
+    /* Consegna cibo pronto */
+    for (int i = 0; i < n; i++) {
+        if (a->cucina->food_ready[i] &&
+            a->lavagna->tables[i].waiter == -1) {
+            a->lavagna->tables[i].waiter = id;
+            break;
+        }
+    }
+
+    /* Prendi ordine */
+    for (int i = 0; i < n; i++) {
+        if (a->sala->tables[i].state == TABLE_TAKEN &&
+            a->sala->tables[i].food_qty == LVL_NONE &&
+            a->lavagna->tables[i].waiter == -1) {
+            a->lavagna->tables[i].waiter = id;
+            break;
+        }
+    }
+
+    /* Pulizia tavoli */
+    for (int i = 0; i < n; i++) {
+        if (a->sala->tables[i].state == TABLE_FREED &&
+            a->lavagna->tables[i].cleaner == -1) {
+            a->lavagna->tables[i].cleaner = id;
+            break;
+        }
+    }
+
+    /* Lavapiatti */
+    if (a->cucina->dirty_plates != LVL_NONE && a->lavagna->dishwasher == -1)
+        a->lavagna->dishwasher = id;
 
     toggle_blackboard(a->semid, 1);
 }

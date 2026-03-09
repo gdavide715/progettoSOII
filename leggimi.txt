@@ -22,3 +22,7 @@ in stato ROLE_NONE, evitando che un singolo thread si assegni a più ruoli conte
 Pulizia > Cassa > Ordini > Cucina > Lavapiatti.
 - ho aggiunto i rilasci del cleaner e del cameriere. Ora il cleaner si libera non appena il tavolo è pulito
 e il cameriere si libera dopo l'ordine finché il cibo non è pronto così può svolgere altri compiti
+
+09/03 Picci:
+- aggiunto strategia profit
+- non scambia quando il lavoratore è stanco, tiene solo fisso cassiere e cuoco
