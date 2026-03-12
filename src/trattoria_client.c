@@ -7,433 +7,439 @@
 #include <sys/sem.h>
 #include <pthread.h>
 #include <sys/shm.h>
-#include <signal.h>
+
 #include "ipc.h"
+
+int instance_running = 0;
 
 //struttura dati per i thread personale
 typedef struct{
     int id;
     int semid;
+    int speed;  
     shm_diningroom_t *sala;
     shm_blackboard_t *lavagna;
     shm_cashdesk_t *cassa;
     shm_kitchen_t *cucina;
     strategy_t strategia;
-    staff_member_t *member;
-    staff_member_t *allMembers;
-    int staff_n;
-    volatile sig_atomic_t *stop;
 } thread_args_t;
 
-void toggle_blackboard(int semid, int op){ //-1 blocca, 1 sblocca
+//Serve per accedere alla lavagna in modo atomico
+void toggle_blackboard(int semid, int op){      //-1 blocca, 1 sblocca
     struct sembuf sops = { .sem_num = SEMIDX_BLACKBOARD, .sem_op=op, .sem_flg=0};
     semop(semid, &sops, 1);
 }
 
-int calcola_punteggio(staff_member_t membro, role_t ruolo, strategy_t strategia){
-    int valore_traits, valore_skills;
-    if(ruolo == ROLE_WAITER){
-        valore_traits = membro.traits[TRAIT_PATIENCE] + membro.traits[TRAIT_PROFESSIONALITY];
-        valore_skills = membro.skills[SKILL_WAITER];
-    }
-    else if(ruolo == ROLE_CASHIER){
-        valore_traits = membro.traits[TRAIT_SOCIABILITY];
-        valore_skills = membro.skills[SKILL_CASHIER];
-    }
-    else if(ruolo == ROLE_COOK){
-        valore_traits = membro.traits[TRAIT_PROFESSIONALITY];
-        valore_skills = membro.skills[SKILL_COOK];
-    }
-    else{
-        valore_traits = 0;
-        valore_skills = membro.skills[SKILL_HELPER];
-    }
+// ================================================================
+// STRATEGIA REPUTATION (non bisogna gestire la stanchezza influisce solo sulle skills e quindi sulla velocità)
+// ================================================================
+void worker_reputation(thread_args_t *a) {
+    int id = a->id;
+    int nTables  = a->sala->tables_n;
 
-    if(strategia == STRATEGY_REPUTATION){
-        return 2 * valore_traits + valore_skills;
-    }
-    else if(strategia == STRATEGY_PROFIT){
-        return 2 * valore_skills + valore_traits;
-    }
-    else{
-        return valore_skills + valore_traits;
-    }
-}
+    toggle_blackboard(a->semid, -1);
 
-int is_free(shm_blackboard_t *lavagna, int staff_id, int tables_n){
-    if(lavagna->cashier == staff_id){
-        return 0;
-    }
-    if(lavagna->cook == staff_id){
-        return 0;
-    }
-    if(lavagna->dishwasher == staff_id){
-        return 0;
-    }
-    for(int i = 0; i < tables_n; i++){
-        if(lavagna->tables[i].cleaner == staff_id){
-            return 0;
-        }
-        if(lavagna->tables[i].waiter == staff_id){
-            return 0;
-        }
-    }
-    return 1;
-}
+    switch (id) {
+        // -------------------------------------------------------
+        // Giulia (0): cuoca fissa + cameriera SOLO per prendere ordini
+        // -------------------------------------------------------
+        case 0:
+            if (a->lavagna->cook == -1)
+                a->lavagna->cook = id;
 
-void* staff_worker(void* arg){
-    thread_args_t *data = (thread_args_t*)arg;
-    int my_id = data->id;
-    printf("Staff worker %d avviato: %s\n", my_id, data->member->name);
+            // Si assegna come cameriera solo per prendere ordini:
+            // il tavolo deve essere occupato (TABLE_TAKEN),
+            // il cibo non ancora ordinato (!food_ready),
+            // e nessun altro cameriere già assegnato
 
-    int q_fatigue = msgget(ftok(TRATTORIA_FTOK_PATH, PROJ_MSG_FATIGUE), 0666);
-    msg_fatigue_t fatigue_msg;
-    role_t my_role;
-    my_role = ROLE_NONE;
-
-    while (!*(data->stop)) {
-        if(msgrcv(q_fatigue, &fatigue_msg, sizeof(msg_fatigue_t)-sizeof(long), my_id+1, IPC_NOWAIT)!=-1){
-            printf("[Staff %d] Nuova stanchezza nel ruolo %d: livello %d\n", my_id, fatigue_msg.role, fatigue_msg.new_lvl);
-        }
-
-        //azione da fare mentre il semaforo è bloccato (pulire tavolo, prendere ordine, cambio ruolo,...)
-        toggle_blackboard(data->semid, -1);
-
-        if (*(data->stop)) {
-            toggle_blackboard(data->semid, 1);
-            break;
-        }
-
-        int sto_lavorando = 0;
-
-        // Verifica se sono assegnato a compiti globali
-        if (data->lavagna->cook == my_id || data->lavagna->cashier == my_id || data->lavagna->dishwasher == my_id) {
-            sto_lavorando = 1;
-        }
-
-        // Verifica se sono assegnato a un tavolo
-        for(int i=0; i<data->sala->tables_n; i++) {
-            if(data->lavagna->tables[i].waiter == my_id || data->lavagna->tables[i].cleaner == my_id) {
-                sto_lavorando = 1;
-                break;
-            }
-        }
-
-        if (!sto_lavorando) {
-            my_role = ROLE_NONE; // Se non sono sulla lavagna, sono libero
-        }
-
-        //rilascio lavapiatti
-        if(data->lavagna->dishwasher == data->id && data->cucina->dirty_plates == LVL_NONE){
-            my_role = ROLE_NONE;
-            data->lavagna->dishwasher=-1;
-        }
-
-        //rilascio cassiere
-        if(data->cassa->pending_payments == 0 && data->lavagna->cashier == data->id){
-            my_role = ROLE_NONE;
-            data->lavagna->cashier = -1;
-        }
-
-        //rilascio cuoco
-        if(data->lavagna->cook == data->id && data->cucina->pending_orders == 0){
-            int flag = 0;
-            for(int i = 0; i < MAX_TABLES; i++){
-                if(data->sala->tables[i].state == TABLE_TAKEN && data->cucina->food_ready[i] == TR_FALSE &&
-                data->sala->tables[i].food_qty > 0){
-                    flag = 1;
+            for (int i = 0; i < nTables; i++) {
+                if (a->sala->tables[i].state == TABLE_TAKEN &&
+                    !a->cucina->food_ready[i]              &&
+                    a->lavagna->tables[i].waiter == -1) 
+                {
+                    a->lavagna->tables[i].waiter = id;
                     break;
                 }
             }
-            if(!flag){
-                my_role = ROLE_NONE;
-                data->lavagna->cook=-1;
-            }
-        }
-
-        //rilascio cameriere
-        for(int i=0; i<data->sala->tables_n; i++){
-            if(data->lavagna->tables[i].waiter == data->id && ((data->sala->tables[i].food_qty > LVL_NONE && data->cucina->food_ready[i] == TR_FALSE) || data->sala->tables[i].state == TABLE_SERVED)){
-                data->lavagna->tables[i].waiter = -1;
-                my_role = ROLE_NONE;
-            }
-        }
-
-        //rilascio cleaner
-        for(int i=0; i<data->sala->tables_n; i++){
-            if(data->lavagna->tables[i].cleaner == data->id && data->sala->tables[i].dirt_level == LVL_NONE){
-                data->lavagna->tables[i].cleaner = -1;
-                my_role = ROLE_NONE;
-            }
-        }
-
-        //ordine (se tavolo è TAKEN metto un waiter)
-        if(my_role == ROLE_NONE){
-            for(int i=0; i<data->sala->tables_n; i++){
-                if(data->lavagna->tables[i].waiter==-1 && ((data->sala->tables[i].state == TABLE_TAKEN && data->sala->tables[i].food_qty == LVL_NONE) || (data->sala->tables[i].food_qty > LVL_NONE && data->cucina->food_ready[i] == TR_TRUE))){
-                    int miglior_id = -1;
-                    int miglior_punteggio = -1;
-                    for(int j = 0; j < data->staff_n; j++){
-                        if(is_free(data->lavagna, j, data->lavagna->tables_n)){
-                            int punteggio = calcola_punteggio(data->allMembers[j], ROLE_WAITER, data->strategia);
-                            if(punteggio > miglior_punteggio){
-                                miglior_id = j;
-                                miglior_punteggio = punteggio;
-                            }
-                        }
-                    }
-                    if(miglior_id == data->id){
-                        data->lavagna-> tables[i].waiter = my_id;
-                        my_role = ROLE_WAITER;
-                        break;
-                    }
+            break;
+        // -------------------------------------------------------
+        // Sara (1): consegna cibo + pulizia tavoli + lavapiatti
+        // -------------------------------------------------------
+        case 1:
+            // Consegna cibo (priorità massima)
+            for (int i = 0; i < nTables; i++) {
+                if (a->cucina->food_ready[i] &&
+                    a->lavagna->tables[i].waiter == -1) {
+                    a->lavagna->tables[i].waiter = id;
+                    break;
                 }
             }
-        }
-
-        //cucina (se ci sono ordini in cucina)
-        if(my_role == ROLE_NONE){
-            if(data->cucina->pending_orders > 0 && data->lavagna->cook == -1){
-                int miglior_id = -1;
-                int miglior_punteggio = -1;
-                for(int i = 0; i < data->staff_n; i++){
-                    if(is_free(data->lavagna, i, data->lavagna->tables_n)){
-                        int punteggio = calcola_punteggio(data->allMembers[i], ROLE_COOK, data->strategia);
-                        if(punteggio > miglior_punteggio){
-                            miglior_id = i;
-                            miglior_punteggio = punteggio;
-                        }
-                    }
-                }
-                if(miglior_id == data->id){
-                    data->lavagna->cook = my_id;
-                    my_role = ROLE_COOK;
+            // Pulizia: TABLE_FREED = famiglia uscita, tavolo sporco
+            for (int i = 0; i < nTables; i++) {
+                if (a->sala->tables[i].state == TABLE_FREED &&
+                    a->lavagna->tables[i].cleaner == -1) {
+                    a->lavagna->tables[i].cleaner = id;
+                    break;
                 }
             }
-        }
-
-        //pagamento (se ci sono pagamenti in cassa)
-        if(my_role == ROLE_NONE){
-            if(data->cassa->pending_payments > 0 && data->lavagna->cashier == -1){
-                int miglior_id = -1;
-                int miglior_punteggio = -1;
-                for(int i = 0; i < data->staff_n; i++){
-                    if(is_free(data->lavagna, i, data->lavagna->tables_n)){
-                        int punteggio = calcola_punteggio(data->allMembers[i], ROLE_CASHIER, data->strategia);
-                        if(punteggio > miglior_punteggio){
-                            miglior_id = i;
-                            miglior_punteggio = punteggio;
-                        }
-                    }
-                }
-                if(miglior_id == data->id){
-                    data->lavagna->cashier = my_id;
-                    my_role = ROLE_CASHIER;
+            // Lavapiatti
+            if (a->cucina->dirty_plates >= LVL_MED &&
+                a->lavagna->dishwasher == -1) {
+                a->lavagna->dishwasher = id;
+            }
+            break;
+        // -------------------------------------------------------
+        // Fabio (2): cassiere fisso + jolly pulizia/lavapiatti
+        // -------------------------------------------------------
+        case 2:
+            if (a->lavagna->cashier == -1)
+                a->lavagna->cashier = id;
+            // Jolly pulizia solo se TABLE_FREED
+            for (int i = 0; i < nTables; i++) {
+                if (a->sala->tables[i].state == TABLE_FREED &&
+                    a->lavagna->tables[i].cleaner == -1) {
+                    a->lavagna->tables[i].cleaner = id;
+                    break;
                 }
             }
-        }
-
-        //lavaggio piatti (se ci sono piatti sporchi e nessuno sta lavando)
-        if(my_role == ROLE_NONE){
-            if(data->cucina->dirty_plates != LVL_NONE && data->lavagna->dishwasher == -1){
-                int miglior_id = -1;
-                int miglior_punteggio = -1;
-                for(int i = 0; i < data->staff_n; i++){
-                    if(is_free(data->lavagna, i, data->lavagna->tables_n)){
-                        int punteggio = calcola_punteggio(data->allMembers[i], ROLE_DISHWASHER, data->strategia);
-                        if(punteggio > miglior_punteggio){
-                            miglior_id = i;
-                            miglior_punteggio = punteggio;
-                        }
-                    }
-                }
-                if(miglior_id == data->id){
-                    data->lavagna->dishwasher = my_id;
-                    my_role = ROLE_DISHWASHER;
+            // Jolly lavapiatti solo in emergenza
+            if (a->cucina->dirty_plates >= LVL_HIGH &&
+                a->lavagna->dishwasher == -1) {
+                a->lavagna->dishwasher = id;
+            }
+            break;
+        // -------------------------------------------------------
+        // Giorgia (3): consegna cibo + pulizia tavoli + lavapiatti
+        // -------------------------------------------------------
+        case 3:
+            // Consegna cibo
+            for (int i = 0; i < nTables; i++) {
+                if (a->cucina->food_ready[i] &&
+                    a->lavagna->tables[i].waiter == -1) {
+                    a->lavagna->tables[i].waiter = id;
+                    break;
                 }
             }
-        }
-
-        //pulizia tavoli (se tavolo è FREED metto cleaner)
-        if(my_role == ROLE_NONE){
-            for(int i=0; i<data->sala->tables_n; i++){
-                if(data->sala->tables[i].state == TABLE_FREED && data->lavagna->tables[i].cleaner==-1){
-                    int miglior_id = -1;
-                    int miglior_punteggio = -1;
-                    for(int j = 0; j < data->staff_n; j++){
-                        if(is_free(data->lavagna, j, data->lavagna->tables_n)){
-                            int punteggio = calcola_punteggio(data->allMembers[j], ROLE_HELPER, data->strategia);
-                            if(punteggio > miglior_punteggio){
-                                miglior_id = j;
-                                miglior_punteggio = punteggio;
-                            }
-                        }
-                    }
-                    if(miglior_id == data->id){
-                        data->lavagna->tables[i].cleaner = my_id;
-                        my_role = ROLE_HELPER;
-                        break;
-                    }
+            // Pulizia: TABLE_FREED
+            for (int i = 0; i < nTables; i++) {
+                if (a->sala->tables[i].state == TABLE_FREED &&
+                    a->lavagna->tables[i].cleaner == -1) {
+                    a->lavagna->tables[i].cleaner = id;
+                    break;
                 }
             }
-        }
-
-        toggle_blackboard(data->semid, 1);
-        usleep(10000);
+            // Lavapiatti
+            if (a->cucina->dirty_plates >= LVL_MED &&
+                a->lavagna->dishwasher == -1) {
+                a->lavagna->dishwasher = id;
+            }
+            break;
     }
+
+    toggle_blackboard(a->semid, 1); // UNLOCK
+}
+
+// ================================================================
+// STRATEGIA PROFIT
+// ================================================================
+static void worker_profit(thread_args_t *a) {
+    int id = a->id;
+    int n  = a->sala->tables_n;
+
+    toggle_blackboard(a->semid, -1);
+
+    /* Cassiere SEMPRE assegnato, come nella reputation */
+    if (a->lavagna->cashier == -1)
+        a->lavagna->cashier = id;
+
+    /* Cuoco SEMPRE assegnato */
+    if (a->lavagna->cook == -1)
+        a->lavagna->cook = id;
+
+    /* Consegna cibo pronto */
+    for (int i = 0; i < n; i++) {
+        if (a->cucina->food_ready[i] &&
+            a->lavagna->tables[i].waiter == -1) {
+            a->lavagna->tables[i].waiter = id;
+            break;
+        }
+    }
+
+    /* Prendi ordine */
+    for (int i = 0; i < n; i++) {
+        if (a->sala->tables[i].state == TABLE_TAKEN &&
+            a->sala->tables[i].food_qty == LVL_NONE &&
+            a->lavagna->tables[i].waiter == -1) {
+            a->lavagna->tables[i].waiter = id;
+            break;
+        }
+    }
+
+    /* Pulizia tavoli */
+    for (int i = 0; i < n; i++) {
+        if (a->sala->tables[i].state == TABLE_FREED &&
+            a->lavagna->tables[i].cleaner == -1) {
+            a->lavagna->tables[i].cleaner = id;
+            break;
+        }
+    }
+
+    /* Lavapiatti */
+    if (a->cucina->dirty_plates != LVL_NONE && a->lavagna->dishwasher == -1)
+        a->lavagna->dishwasher = id;
+
+    toggle_blackboard(a->semid, 1);
+}
+
+// ================================================================
+// DISPATCHER
+// ================================================================
+void *staff_worker(void *arg) {
+    //cast per accedere ai campi
+    thread_args_t *a = (thread_args_t *)arg;
+
+    int speed = a->speed;
+    if (speed <= 0) speed = 1;
+
+    int sleep_us = 10000 / speed;
+
+    if (sleep_us < 500) sleep_us = 500;
+
+    //Il thread gira in loop finché instance_running è 1
+    while (instance_running) {
+        if (a->strategia == STRATEGY_REPUTATION)
+            worker_reputation(a);
+        else
+            worker_profit(a);
+
+        //dorme per i millisecondi calcolati prima
+        usleep(sleep_us);
+    }
+
     return NULL;
 }
 
 int main(int argc, char *argv[]) {
-    // 1. Gestione parametri riga di comando
+
+    //--------Connessione-------
+
+    // 1. Parametri riga di comando
     strategy_t scelta_strategia = STRATEGY_NONE;
+
+    // controllo che la strategia si scelta correttamente 
     if (argc >= 3 && strcmp(argv[1], "--strategy") == 0) {
-        if (strcmp(argv[2], "profit") == 0) scelta_strategia = STRATEGY_PROFIT;
+        if      (strcmp(argv[2], "profit")     == 0) scelta_strategia = STRATEGY_PROFIT;
         else if (strcmp(argv[2], "reputation") == 0) scelta_strategia = STRATEGY_REPUTATION;
     }
+
     if (scelta_strategia == STRATEGY_NONE) {
         fprintf(stderr, "Uso: %s --strategy <profit|reputation>\n", argv[0]);
         exit(1);
     }
 
-    // 2. Chiavi e code
+    // 2. Code di messaggi
+
+    //genera una chiave IPC univoca a partire da un file sul filesystem e un numero identificativo (genera la stessa chiave generata nel server)
     key_t key_c2s = ftok(TRATTORIA_FTOK_PATH, PROJ_MSG_C2S);
+    //                    "/tmp/trattoria_ipc_key"   0x41
     key_t key_s2c = ftok(TRATTORIA_FTOK_PATH, PROJ_MSG_S2C);
-    int msqid_c2s = msgget(key_c2s, 0666);
-    int msqid_s2c = msgget(key_s2c, 0666);
+    //                    "/tmp/trattoria_ipc_key"   0x42
 
-    //chiavi memorie condivise
-    int shm_dr_id = shmget(ftok(TRATTORIA_FTOK_PATH, PROJ_DININGROOM), sizeof(shm_diningroom_t), 0666);
-    int shm_ki_id = shmget(ftok(TRATTORIA_FTOK_PATH, PROJ_KITCHEN), sizeof(shm_kitchen_t), 0666);
-    int shm_bb_id = shmget(ftok(TRATTORIA_FTOK_PATH, PROJ_BLACKBOARD), sizeof(shm_blackboard_t), 0666);
-    int shm_cd_id = shmget(ftok(TRATTORIA_FTOK_PATH, PROJ_CASHDESK), sizeof(shm_cashdesk_t), 0666);
-    int semid = semget(ftok(TRATTORIA_FTOK_PATH, PROJ_SEM), SEM_NSEMS, 0666);
+    //cerca una coda di messaggi già esistente con quella chiave e restituisce il suo ID
+    int msqid_c2s = msgget(key_c2s, 0666);  // coda client → server
+    int msqid_s2c = msgget(key_s2c, 0666);  // coda server → client
 
-    //puntatori alle strutture
-    shm_diningroom_t *sala = shmat(shm_dr_id, NULL, 0);
-    shm_kitchen_t *cucina = shmat(shm_ki_id, NULL, 0);
-    shm_cashdesk_t *cassa = shmat(shm_cd_id, NULL, 0);
-    shm_blackboard_t *lavagna = shmat(shm_bb_id, NULL, 0);
-
+    //se non esiste il server non è attivo
     if (msqid_c2s == -1 || msqid_s2c == -1) {
-        perror("Errore connessione code (il server è attivo?)");
+        perror("Il server non è attivo!");
         exit(1);
     }
 
-    // 3. Invio HELLO
+    // 3. Shared memory (dove venogno segnati lo stato di sala da pranzo, cucina, lavagna ruoli e cassa)
+
+    //genera chiavi con percorso univoco e numero (uguale anche per il server)
+    key_t key_dr = ftok(TRATTORIA_FTOK_PATH, PROJ_DININGROOM);
+    key_t key_ki = ftok(TRATTORIA_FTOK_PATH, PROJ_KITCHEN);
+    key_t key_bb = ftok(TRATTORIA_FTOK_PATH, PROJ_BLACKBOARD);
+    key_t key_cd = ftok(TRATTORIA_FTOK_PATH, PROJ_CASHDESK);
+
+    //cerca una memoria condivisa già esistente con quella chiave e restituisce il suo ID
+
+    //stato dei tavoli (TABLE_EMPTY = 0, TABLE_TAKEN = 1, TABLE_SERVED = 2, TABLE_FREED = 3)
+    int shm_dr_id = shmget(key_dr, sizeof(shm_diningroom_t), 0666);
+    //ordini pendenti, piatti pronti: vettore di booleani, piatti puliti e sporchi (livello) 
+    int shm_ki_id = shmget(key_ki, sizeof(shm_kitchen_t),    0666);
+    //cuoco, cassiere, pulisci piatti, cameriere e pulitore tavoli (per ogni taovlo ci può essere un membro dello staff diverso)
+    int shm_bb_id = shmget(key_bb, sizeof(shm_blackboard_t), 0666);
+    //pagamenti pendenti
+    int shm_cd_id = shmget(key_cd, sizeof(shm_cashdesk_t),   0666);
+
+    //controlla eventuali errori di shmget
+    if (shm_dr_id == -1 || shm_ki_id == -1 || shm_bb_id == -1 || shm_cd_id == -1) {
+        perror("errore shmget memorie condivise");
+        exit(1);
+    }
+
+
+    //ora la struttura thread_args_t punta alla stessa area di memoria modificata dal server
+    shm_diningroom_t *sala    = shmat(shm_dr_id, NULL, 0);
+    shm_kitchen_t    *cucina  = shmat(shm_ki_id, NULL, 0);
+    shm_blackboard_t *lavagna = shmat(shm_bb_id, NULL, 0);
+    shm_cashdesk_t   *cassa   = shmat(shm_cd_id, NULL, 0);
+
+    
+    if (sala    == (void*)-1 || cucina  == (void*)-1 ||
+        lavagna == (void*)-1 || cassa   == (void*)-1) {
+        perror("errore shmat memorie condivise");
+        exit(1);
+    }
+
+    //per evitare che due trhead scrivano assieme nella lavagna
+    key_t key_sem = ftok(TRATTORIA_FTOK_PATH, PROJ_SEM);
+    int semid = semget(key_sem, SEM_NSEMS, 0666);
+
+    //errore creazione semafoto
+    if (semid == -1) { 
+        perror("errore shmget semaforo"); 
+        exit(1); 
+    }
+
+    // 4.  Handshake -- saluto iniziale
+
     msg_hello_t hello;
-    memset(&hello, 0, sizeof(hello));
+
+    //forse meglio (potrebbe contenere valori casuali rimasti nello stack da chiamate di funzione precedenti)
+    //msg_hello_t hello = {0};
+
+    //compilamento parametri hello 
     hello.mtype = MSGTYPE_HELLO;
     hello.pid = getpid();
-    hello.studentid_n = 3;
+    hello.studentid_n  = 3;
     strncpy(hello.studentids[0], "VR517000", STUDENTID_MAXLEN);
     strncpy(hello.studentids[1], "VR517056", STUDENTID_MAXLEN);
     strncpy(hello.studentids[2], "VR517756", STUDENTID_MAXLEN);
     hello.has_strategy = TR_TRUE;
+    hello.strategy     = scelta_strategia;
 
-    // Ora specifichiamo la strategia
-    hello.strategy = scelta_strategia;
-    printf("Client [%d]: Invio saluto con strategia %d...\n", hello.pid, hello.strategy);
+    printf("Client [%d]: invio saluto con strategia %d...\n", hello.pid, hello.strategy);
     msgsnd(msqid_c2s, &hello, sizeof(msg_hello_t) - sizeof(long), 0);
 
-    // 4. Ricezione risposta (Distinguiamo tra Welcome ed Error)
-    // Usiamo un buffer generico grande abbastanza per entrambe
+    // 5. Risposta welcome/error (Distinguiamo tra Welcome ed Error)
+
+     // Usiamo un buffer generico grande abbastanza per entrambe
     union {
-        long mtype;
+        long          mtype;
         msg_welcome_t welcome;
-        msg_error_t error;
-    } buffer;
+        msg_error_t   error;
+    } wbuf;
 
-    printf("Client: In attesa di risposta dal server...\n");
-    if (msgrcv(msqid_s2c, &buffer, sizeof(msg_welcome_t) - sizeof(long), 0, 0) == -1) {
-        perror("Errore msgrcv");
+    //in buffer.mtype salva il tipo. Se non va a buon fine msgrcv (errore nella chiamata di sistema) esce
+    printf("Client: attesa risposta dal server...\n");
+    if (msgrcv(msqid_s2c, &wbuf, sizeof(wbuf) - sizeof(long), 0, 0) == -1) {
+        perror("errore msgrcv welcome");
         exit(1);
     }
 
-    if (buffer.mtype == MSGTYPE_ERROR) {
-        printf("ERRORE DAL SERVER: %s\n", buffer.error.message);
+    //controlla il tipo se c'è un errore esce
+    if (wbuf.mtype == MSGTYPE_ERROR) {
+        fprintf(stderr, "Errore dal server: %s\n", wbuf.error.message);
         exit(1);
     }
 
-    if (buffer.mtype == MSGTYPE_WELCOME) {
-        printf("Connessione stabilita! Gruppo: %s\n", buffer.welcome.group);
-        printf("Staff: %d, Tavoli: %d\n", buffer.welcome.staff_n, buffer.welcome.tables_n);
-
-        // Iteriamo per il numero di membri dello staff indicati dal server
-        for (int i = 0; i < buffer.welcome.staff_n; i++) {
-            staff_member_t s = buffer.welcome.staff[i];
-            printf("Membro Staff [%d]: %s\n", i, s.name);
-
-            // Stampa delle Skills (Waiter, Cook, Helper, Cashier)
-            printf(" Competenze: Waiter:%d, Cook:%d, Helper:%d, Cashier:%d\n", s.skills[SKILL_WAITER], s.skills[SKILL_COOK], s.skills[SKILL_HELPER], s.skills[SKILL_CASHIER]);
-
-            // Stampa dei Traits (Patience, Sociability, Professionalism, Resilience)
-            printf(" Tratti: Patience:%d, Sociability:%d, Professionalism:%d, Resilience:%d\n", s.traits[TRAIT_PATIENCE], s.traits[TRAIT_SOCIABILITY], s.traits[TRAIT_PROFESSIONALITY], s.traits[TRAIT_RESISTANCE]);
-            printf("--------------------------------------------------\n");
-        }
+    //nè errore nè weolcome ---> tipo inatteso esce dal programma
+    if (wbuf.mtype != MSGTYPE_WELCOME) {
+        fprintf(stderr, "Messaggio inatteso: %ld\n", wbuf.mtype);
+        exit(1);
     }
 
-    volatile sig_atomic_t stop_instance = 0;
+    //Tutto era corretto stampa le skills e i tratti petti del personale
+    printf("Connessione stabilita! Gruppo: %s\n", wbuf.welcome.group);
+    printf("Staff: %d, Tavoli: %d\n", wbuf.welcome.staff_n, wbuf.welcome.tables_n);
+
+    //scorri tutti i membri
+    for (int i = 0; i < wbuf.welcome.staff_n; i++) {
+        staff_member_t s = wbuf.welcome.staff[i];
+        printf("Membro Staff [%d]: %s\n", i, s.name);
+        printf("  Competenze: Waiter:%d, Cook:%d, Helper:%d, Cashier:%d\n",
+               s.skills[SKILL_WAITER], s.skills[SKILL_COOK],
+               s.skills[SKILL_HELPER], s.skills[SKILL_CASHIER]);
+        printf("  Tratti: Patience:%d, Sociability:%d, Professionalism:%d, Resilience:%d\n",
+               s.traits[TRAIT_PATIENCE], s.traits[TRAIT_SOCIABILITY],
+               s.traits[TRAIT_PROFESSIONALITY], s.traits[TRAIT_RESISTANCE]);
+        printf("--------------------------------------------------\n");
+    }
+
+    // 6. Loop istanze — buffer union abbastanza grande per tutti i tipi attesi
     while (1) {
-        msg_instance_t inst;
-        if (msgrcv(msqid_s2c, &inst, sizeof(msg_instance_t) - sizeof(long), 0, 0) == -1) {
-            perror("msgrcv");
+        //struttura abbastanza grnde per ottenere messaggi di tipo istanza e di tipo fine
+        union {
+            long                mtype;
+            msg_instance_t      instance;
+            msg_end_t           end;
+        } ibuf;
+
+        if (msgrcv(msqid_s2c, &ibuf, sizeof(ibuf) - sizeof(long), 0, 0) == -1) {
+            perror("errore msgrcv istanza");
             break;
         }
 
-        /* ---- CHIUSURA SERVER ---- */
-        if (inst.mtype == MSGTYPE_END) {
-            printf("Server ha inviato MSGTYPE_END. Chiusura client.\n");
+        if (ibuf.mtype == MSGTYPE_END) {
+            printf("Fine sessione ricevuta dal server.\n");
             break;
         }
 
-        /* ---- NUOVA ISTANZA ---- */
-        if (inst.mtype == MSGTYPE_INSTANCE) {
-            printf("Avvio Istanza %d (%d famiglie)\n", inst.instance_id, inst.families_n);
-            stop_instance = 0;
-
-            pthread_t threads[MAX_STAFF];
-            thread_args_t t_args[MAX_STAFF];
-
-            for (int i = 0; i < buffer.welcome.staff_n; i++) {
-                t_args[i] = (thread_args_t){
-                    .id = i,
-                    .semid = semid,
-                    .sala = sala,
-                    .cucina = cucina,
-                    .lavagna = lavagna,
-                    .cassa = cassa,
-                    .strategia = inst.strategy,
-                    .member = &buffer.welcome.staff[i],
-                    .allMembers = &buffer.welcome.staff[0],
-                    .staff_n = buffer.welcome.staff_n,
-                    .stop = &stop_instance
-                };
-                pthread_create(&threads[i], NULL, staff_worker, &t_args[i]);
-            }
-
-            /* ---- ATTESA FINE ISTANZA ---- */
-            msg_instance_done_t done;
-            if (msgrcv(msqid_s2c, &done, sizeof(msg_instance_done_t) - sizeof(long), MSGTYPE_INSTANCE_DONE, 0) == -1) {
-                perror("msgrcv INSTANCE_DONE");
-                break;
-            }
-            printf("Istanza completata. Risultato: %s\n", done.average_families_score_review);
-
-            /* ---- TERMINAZIONE THREAD ---- */
-            stop_instance = 1;
-            for (int i = 0; i < buffer.welcome.staff_n; i++) {
-                pthread_join(threads[i], NULL);
-            }
-            printf("Thread terminati correttamente.\n");
+        if (ibuf.mtype != MSGTYPE_INSTANCE) {
+            fprintf(stderr, "Messaggio inatteso nel loop istanze: %ld\n", ibuf.mtype);
+            continue;
         }
+
+        //Stampa di tutte le informazioni di istanza
+        printf("Avvio istanza %d (strategia=%d, famiglie=%d, speed=%d)\n",
+               ibuf.instance.instance_id, ibuf.instance.strategy,
+               ibuf.instance.families_n,  ibuf.instance.speed);
+
+        // Avvio thread per ogni membro dello staff
+        pthread_t     threads[MAX_STAFF];
+        thread_args_t t_args[MAX_STAFF];
+        //Il flag instance_running = 1 segnala ai thread che devono lavorare.
+        instance_running = 1;
+
+        //ogni thread ha la propria struttura
+        for (int i = 0; i < wbuf.welcome.staff_n; i++) {
+            t_args[i] = (thread_args_t){
+                .id        = i,
+                .semid     = semid,
+                .speed = ibuf.instance.speed,
+                .sala      = sala,
+                .cucina    = cucina,
+                .lavagna   = lavagna,
+                .cassa     = cassa,
+                .strategia = ibuf.instance.strategy
+            };
+            pthread_create(&threads[i], NULL, staff_worker, &t_args[i]);
+        }
+
+        // Attesa completamento istanza
+        msg_instance_done_t done;
+        if (msgrcv(msqid_s2c, &done, sizeof(done) - sizeof(long),
+                   MSGTYPE_INSTANCE_DONE, 0) == -1) {
+            perror("errore msgrcv instance_done");
+        } else {
+            printf("Istanza %d completata. Risultato: %s\n",
+                   done.instance_id, done.average_families_score_review);
+        }
+
+        // Terminazione ordinata dei thread con la join (più sicuro)
+        instance_running = 0;
+        for (int i = 0; i < wbuf.welcome.staff_n; i++)
+            pthread_join(threads[i], NULL);
     }
 
-    /* ---- CLEANUP FINALE ---- */
+    // 7. Distacco memorie condivise
     shmdt(sala);
     shmdt(cucina);
     shmdt(lavagna);
     shmdt(cassa);
-    printf("Client terminato correttamente.\n");
+
     return 0;
 }

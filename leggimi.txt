@@ -30,3 +30,7 @@ determinato ruolo in una determinata strategia (in reputazione hanno la priorit�
 priorità le skills)
 - ho aggiunto la funzione is_free che controlla se un membro dello staff è libero
 - ho modificato la logica di rilascio del cuoco: prima avrebbe potuto lasciare il lavoro senza averlo ultimato
+
+09/03 Picci:
+- aggiunto strategia profit
+- non scambia quando il lavoratore è stanco, tiene solo fisso cassiere e cuoco
