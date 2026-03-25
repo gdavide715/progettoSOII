@@ -17,6 +17,8 @@ typedef struct{
     int id;
     int semid;
     int speed;  
+    int msqid_fatigue;              // coda notifiche stanchezza
+    level_t fatigue[NUM_ROLES];     // stanchezza per ruolo (aggiornata dal thread stesso)
     shm_diningroom_t *sala;
     shm_blackboard_t *lavagna;
     shm_cashdesk_t *cassa;
@@ -28,6 +30,21 @@ typedef struct{
 void toggle_blackboard(int semid, int op){      //-1 blocca, 1 sblocca
     struct sembuf sops = { .sem_num = SEMIDX_BLACKBOARD, .sem_op=op, .sem_flg=0};
     semop(semid, &sops, 1);
+}
+
+//funzione per leggere la stanchezza (non bloccante)
+void update_fatigue(thread_args_t *a) {
+    // Ogni thread legge solo i propri messaggi (mtype = id + 1)
+    msg_fatigue_t msg;
+    while (msgrcv(a->msqid_fatigue, &msg,
+                  sizeof(msg_fatigue_t) - sizeof(long),
+                  a->id + 1,          // solo i miei messaggi
+                  IPC_NOWAIT) != -1)  // non bloccante
+    {
+        a->fatigue[msg.role] = msg.new_lvl;
+        printf("[staff %d] stanchezza ruolo %d → %d\n",
+               a->id, msg.role, msg.new_lvl);
+    }
 }
 
 // ================================================================
@@ -255,6 +272,14 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
+    //coda fatica
+    key_t key_fat  = ftok(TRATTORIA_FTOK_PATH, PROJ_MSG_FATIGUE);
+    int msqid_fatigue = msgget(key_fat, 0666);
+    if (msqid_fatigue == -1) {
+        perror("errore msgget fatigue");
+        exit(1);
+    }
+
     // 3. Shared memory (dove venogno segnati lo stato di sala da pranzo, cucina, lavagna ruoli e cassa)
 
     //genera chiavi con percorso univoco e numero (uguale anche per il server)
@@ -410,6 +435,7 @@ int main(int argc, char *argv[]) {
                 .id        = i,
                 .semid     = semid,
                 .speed = ibuf.instance.speed,
+                .msqid_fatigue  = msqid_fatigue,
                 .sala      = sala,
                 .cucina    = cucina,
                 .lavagna   = lavagna,
