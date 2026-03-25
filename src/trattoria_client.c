@@ -42,8 +42,7 @@ void update_fatigue(thread_args_t *a) {
                   IPC_NOWAIT) != -1)  // non bloccante
     {
         a->fatigue[msg.role] = msg.new_lvl;
-        printf("[staff %d] stanchezza ruolo %d → %d\n",
-               a->id, msg.role, msg.new_lvl);
+        //printf("[staff %d] stanchezza ruolo %d → %d\n", a->id, msg.role, msg.new_lvl); //da commentare
     }
 }
 
@@ -54,6 +53,9 @@ void worker_reputation(thread_args_t *a) {
     int id = a->id;
     int nTables  = a->sala->tables_n;
 
+    // Leggi nuovi messaggi di stanchezza prima di decidere
+    update_fatigue(a);
+
     toggle_blackboard(a->semid, -1);
 
     switch (id) {
@@ -61,21 +63,24 @@ void worker_reputation(thread_args_t *a) {
         // Giulia (0): cuoca fissa + cameriera SOLO per prendere ordini
         // -------------------------------------------------------
         case 0:
-            if (a->lavagna->cook == -1)
+            if (a->lavagna->cook == -1 && a->fatigue[ROLE_COOK] < LVL_HIGH){
                 a->lavagna->cook = id;
+            }    
 
             // Si assegna come cameriera solo per prendere ordini:
             // il tavolo deve essere occupato (TABLE_TAKEN),
             // il cibo non ancora ordinato (!food_ready),
             // e nessun altro cameriere già assegnato
 
-            for (int i = 0; i < nTables; i++) {
-                if (a->sala->tables[i].state == TABLE_TAKEN &&
-                    !a->cucina->food_ready[i]              &&
-                    a->lavagna->tables[i].waiter == -1) 
-                {
-                    a->lavagna->tables[i].waiter = id;
-                    break;
+            if (a->fatigue[ROLE_WAITER] < LVL_HIGH) {
+                for (int i = 0; i < nTables; i++) {
+                    if (a->sala->tables[i].state == TABLE_TAKEN &&
+                        !a->cucina->food_ready[i]              &&
+                        a->lavagna->tables[i].waiter == -1) 
+                    {
+                        a->lavagna->tables[i].waiter = id;
+                        break;
+                    }
                 }
             }
             break;
@@ -83,6 +88,7 @@ void worker_reputation(thread_args_t *a) {
         // Sara (1): consegna cibo + pulizia tavoli + lavapiatti
         // -------------------------------------------------------
         case 1:
+
             // Consegna cibo (priorità massima)
             for (int i = 0; i < nTables; i++) {
                 if (a->cucina->food_ready[i] &&
@@ -91,17 +97,20 @@ void worker_reputation(thread_args_t *a) {
                     break;
                 }
             }
+            
             // Pulizia: TABLE_FREED = famiglia uscita, tavolo sporco
-            for (int i = 0; i < nTables; i++) {
-                if (a->sala->tables[i].state == TABLE_FREED &&
-                    a->lavagna->tables[i].cleaner == -1) {
-                    a->lavagna->tables[i].cleaner = id;
-                    break;
+            if (a->fatigue[ROLE_HELPER] < LVL_HIGH) {
+                for (int i = 0; i < nTables; i++) {
+                    if (a->sala->tables[i].state == TABLE_FREED &&
+                        a->lavagna->tables[i].cleaner == -1) {
+                        a->lavagna->tables[i].cleaner = id;
+                        break;
+                    }
                 }
             }
             // Lavapiatti
             if (a->cucina->dirty_plates >= LVL_MED &&
-                a->lavagna->dishwasher == -1) {
+                a->lavagna->dishwasher == -1 &&  a->fatigue[ROLE_DISHWASHER] < LVL_HIGH) {
                 a->lavagna->dishwasher = id;
             }
             break;
@@ -109,19 +118,23 @@ void worker_reputation(thread_args_t *a) {
         // Fabio (2): cassiere fisso + jolly pulizia/lavapiatti
         // -------------------------------------------------------
         case 2:
-            if (a->lavagna->cashier == -1)
+            if (a->lavagna->cashier == -1 && a->fatigue[ROLE_CASHIER] < LVL_HIGH)
                 a->lavagna->cashier = id;
+
             // Jolly pulizia solo se TABLE_FREED
-            for (int i = 0; i < nTables; i++) {
-                if (a->sala->tables[i].state == TABLE_FREED &&
-                    a->lavagna->tables[i].cleaner == -1) {
-                    a->lavagna->tables[i].cleaner = id;
-                    break;
+            if (a->fatigue[ROLE_HELPER] < LVL_HIGH) {
+                for (int i = 0; i < nTables; i++) {
+                    if (a->sala->tables[i].state == TABLE_FREED &&
+                        a->lavagna->tables[i].cleaner == -1) {
+                        a->lavagna->tables[i].cleaner = id;
+                        break;
+                    }
                 }
             }
+
             // Jolly lavapiatti solo in emergenza
             if (a->cucina->dirty_plates >= LVL_HIGH &&
-                a->lavagna->dishwasher == -1) {
+                a->lavagna->dishwasher == -1 && a->fatigue[ROLE_DISHWASHER] < LVL_HIGH) {
                 a->lavagna->dishwasher = id;
             }
             break;
@@ -137,17 +150,20 @@ void worker_reputation(thread_args_t *a) {
                     break;
                 }
             }
+            
             // Pulizia: TABLE_FREED
-            for (int i = 0; i < nTables; i++) {
-                if (a->sala->tables[i].state == TABLE_FREED &&
-                    a->lavagna->tables[i].cleaner == -1) {
-                    a->lavagna->tables[i].cleaner = id;
-                    break;
+            if (a->fatigue[ROLE_HELPER] < LVL_HIGH) {
+                for (int i = 0; i < nTables; i++) {
+                    if (a->sala->tables[i].state == TABLE_FREED &&
+                        a->lavagna->tables[i].cleaner == -1) {
+                        a->lavagna->tables[i].cleaner = id;
+                        break;
+                    }
                 }
             }
             // Lavapiatti
             if (a->cucina->dirty_plates >= LVL_MED &&
-                a->lavagna->dishwasher == -1) {
+                a->lavagna->dishwasher == -1 && a->fatigue[ROLE_DISHWASHER] < LVL_HIGH) {
                 a->lavagna->dishwasher = id;
             }
             break;
