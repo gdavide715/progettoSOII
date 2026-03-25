@@ -10,6 +10,10 @@
 
 #include "ipc.h"
 
+// Quante iterazioni di riposo prima di considerarsi "riposato"
+// Calibra in base alla velocità: più speed è alto, più iterazioni passano in fretta
+#define REST_THRESHOLD 500
+
 int instance_running = 0;
 
 //struttura dati per i thread personale
@@ -18,6 +22,7 @@ typedef struct{
     int semid;
     int speed;  
     int msqid_fatigue;              // coda notifiche stanchezza
+    int rest_counter[NUM_ROLES];
     level_t fatigue[NUM_ROLES];     // stanchezza per ruolo (aggiornata dal thread stesso)
     shm_diningroom_t *sala;
     shm_blackboard_t *lavagna;
@@ -42,8 +47,27 @@ void update_fatigue(thread_args_t *a) {
                   IPC_NOWAIT) != -1)  // non bloccante
     {
         a->fatigue[msg.role] = msg.new_lvl;
-        //printf("[staff %d] stanchezza ruolo %d → %d\n", a->id, msg.role, msg.new_lvl); //da commentare
+        printf("[staff %d] stanchezza ruolo %d → %d\n", a->id, msg.role, msg.new_lvl); //da commentare
     }
+}
+
+// Controlla se un membro è troppo stanco per un ruolo.
+// Se stanco, incrementa il contatore di riposo.
+// Quando ha riposato abbastanza, azzera la stanchezza locale → può tornare.
+// Restituisce 1 se può lavorare, 0 se deve ancora riposare.
+int can_work(thread_args_t *a, role_t role) {
+    if (a->fatigue[role] < LVL_MED)
+        return 1;
+
+    // È stanco: riposa
+    a->rest_counter[role]++;
+    if (a->rest_counter[role] >= REST_THRESHOLD) {
+        // Ha riposato abbastanza: resettiamo la stanchezza locale
+        a->fatigue[role] = LVL_NONE;
+        a->rest_counter[role] = 0;
+        return 1;
+    }
+    return 0;
 }
 
 // ================================================================
@@ -63,22 +87,29 @@ void worker_reputation(thread_args_t *a) {
         // Giulia (0): cuoca fissa + cameriera SOLO per prendere ordini
         // -------------------------------------------------------
         case 0:
-            if (a->lavagna->cook == -1 && a->fatigue[ROLE_COOK] < LVL_HIGH){
-                a->lavagna->cook = id;
-            }    
+            // --- Cuoca (ruolo primario di Giulia) ---
+            if (a->lavagna->cook == a->id) {
+                // È già assegnata: controlla se è diventata troppo stanca
+                if (!can_work(a, ROLE_COOK)) {
+                    // Si de-assegna per riposare
+                    a->lavagna->cook = -1;
+                }
+            } else if (a->lavagna->cook == -1 && can_work(a, ROLE_COOK)) {
+                // La cucina è libera e lei è riposata: torna a cucinare
+                a->lavagna->cook = a->id;
+            }
+            // Se cook != -1 e != a->id, qualcun altro sta cucinando (fallback):
+            // Giulia non interferisce, aspetta e incrementa il rest_counter naturalmente
+            // perché can_work viene chiamato anche nel ramo else (se cook==-1)
 
-            // Si assegna come cameriera solo per prendere ordini:
-            // il tavolo deve essere occupato (TABLE_TAKEN),
-            // il cibo non ancora ordinato (!food_ready),
-            // e nessun altro cameriere già assegnato
-
-            if (a->fatigue[ROLE_WAITER] < LVL_HIGH) {
+            // --- Cameriera per presa ordini (ruolo secondario) ---
+            if (can_work(a, ROLE_WAITER)) {
                 for (int i = 0; i < nTables; i++) {
                     if (a->sala->tables[i].state == TABLE_TAKEN &&
                         !a->cucina->food_ready[i]              &&
-                        a->lavagna->tables[i].waiter == -1) 
+                        a->lavagna->tables[i].waiter == -1)
                     {
-                        a->lavagna->tables[i].waiter = id;
+                        a->lavagna->tables[i].waiter = a->id;
                         break;
                     }
                 }
@@ -99,7 +130,7 @@ void worker_reputation(thread_args_t *a) {
             }
             
             // Pulizia: TABLE_FREED = famiglia uscita, tavolo sporco
-            if (a->fatigue[ROLE_HELPER] < LVL_HIGH) {
+            if (can_work(a, ROLE_HELPER)) {
                 for (int i = 0; i < nTables; i++) {
                     if (a->sala->tables[i].state == TABLE_FREED &&
                         a->lavagna->tables[i].cleaner == -1) {
@@ -110,7 +141,7 @@ void worker_reputation(thread_args_t *a) {
             }
             // Lavapiatti
             if (a->cucina->dirty_plates >= LVL_MED &&
-                a->lavagna->dishwasher == -1 &&  a->fatigue[ROLE_DISHWASHER] < LVL_HIGH) {
+                a->lavagna->dishwasher == -1 &&  can_work(a, ROLE_DISHWASHER)) {
                 a->lavagna->dishwasher = id;
             }
             break;
@@ -122,7 +153,7 @@ void worker_reputation(thread_args_t *a) {
                 a->lavagna->cashier = id;
 
             // Jolly pulizia solo se TABLE_FREED
-            if (a->fatigue[ROLE_HELPER] < LVL_HIGH) {
+            if (can_work(a, ROLE_HELPER)) {
                 for (int i = 0; i < nTables; i++) {
                     if (a->sala->tables[i].state == TABLE_FREED &&
                         a->lavagna->tables[i].cleaner == -1) {
@@ -134,7 +165,7 @@ void worker_reputation(thread_args_t *a) {
 
             // Jolly lavapiatti solo in emergenza
             if (a->cucina->dirty_plates >= LVL_HIGH &&
-                a->lavagna->dishwasher == -1 && a->fatigue[ROLE_DISHWASHER] < LVL_HIGH) {
+                a->lavagna->dishwasher == -1 && can_work(a, ROLE_DISHWASHER)) {
                 a->lavagna->dishwasher = id;
             }
             break;
@@ -152,7 +183,7 @@ void worker_reputation(thread_args_t *a) {
             }
             
             // Pulizia: TABLE_FREED
-            if (a->fatigue[ROLE_HELPER] < LVL_HIGH) {
+            if (can_work(a, ROLE_HELPER)) {
                 for (int i = 0; i < nTables; i++) {
                     if (a->sala->tables[i].state == TABLE_FREED &&
                         a->lavagna->tables[i].cleaner == -1) {
@@ -163,7 +194,7 @@ void worker_reputation(thread_args_t *a) {
             }
             // Lavapiatti
             if (a->cucina->dirty_plates >= LVL_MED &&
-                a->lavagna->dishwasher == -1 && a->fatigue[ROLE_DISHWASHER] < LVL_HIGH) {
+                a->lavagna->dishwasher == -1 && can_work(a, ROLE_DISHWASHER)) {
                 a->lavagna->dishwasher = id;
             }
             break;
