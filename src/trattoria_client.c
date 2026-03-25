@@ -12,7 +12,7 @@
 
 // Quante iterazioni di riposo prima di considerarsi "riposato"
 // Calibra in base alla velocità: più speed è alto, più iterazioni passano in fretta
-#define REST_THRESHOLD 500
+#define REST_THRESHOLD 2000
 
 int instance_running = 0;
 
@@ -88,12 +88,10 @@ void worker_reputation(thread_args_t *a) {
         // -------------------------------------------------------
         case 0:
             // --- Cuoca (ruolo primario di Giulia) ---
-            if (a->lavagna->cook == a->id) {
-                // È già assegnata: controlla se è diventata troppo stanca
-                if (!can_work(a, ROLE_COOK)) {
+            if (a->lavagna->cook == a->id && !can_work(a, ROLE_COOK)) {
+                    // È già assegnataed è troppo stanca
                     // Si de-assegna per riposare
                     a->lavagna->cook = -1;
-                }
             } else if (a->lavagna->cook == -1 && can_work(a, ROLE_COOK)) {
                 // La cucina è libera e lei è riposata: torna a cucinare
                 a->lavagna->cook = a->id;
@@ -103,17 +101,29 @@ void worker_reputation(thread_args_t *a) {
             // perché can_work viene chiamato anche nel ramo else (se cook==-1)
 
             // --- Cameriera per presa ordini (ruolo secondario) ---
-            if (can_work(a, ROLE_WAITER)) {
+
+            //controlla se è già assegnato come cameriere in qualche tavolo ed è stanco (se si toglilo da quel tavolo)
+            //bisogna fare la ricerca del cameriere
+            if (!can_work(a, ROLE_WAITER)) {
                 for (int i = 0; i < nTables; i++) {
-                    if (a->sala->tables[i].state == TABLE_TAKEN &&
-                        !a->cucina->food_ready[i]              &&
-                        a->lavagna->tables[i].waiter == -1)
-                    {
-                        a->lavagna->tables[i].waiter = a->id;
-                        break;
+                    if (a->lavagna->tables[i].waiter == a->id) {
+                        // De-assegna da questo tavolo e continua a cercare negli altri
+                        a->lavagna->tables[i].waiter = -1;
                     }
                 }
             }
+            else {
+                    for (int i = 0; i < nTables; i++) {
+                        if (a->sala->tables[i].state == TABLE_TAKEN &&
+                            !a->cucina->food_ready[i]              &&
+                            a->lavagna->tables[i].waiter == -1)
+                        {
+                            a->lavagna->tables[i].waiter = a->id;
+                            break;
+                        }
+                    }
+                }
+            
             break;
         // -------------------------------------------------------
         // Sara (1): consegna cibo + pulizia tavoli + lavapiatti
@@ -149,7 +159,7 @@ void worker_reputation(thread_args_t *a) {
         // Fabio (2): cassiere fisso + jolly pulizia/lavapiatti
         // -------------------------------------------------------
         case 2:
-            if (a->lavagna->cashier == -1 && a->fatigue[ROLE_CASHIER] < LVL_HIGH)
+            if (a->lavagna->cashier == -1 && can_work(a, ROLE_CASHIER))
                 a->lavagna->cashier = id;
 
             // Jolly pulizia solo se TABLE_FREED
