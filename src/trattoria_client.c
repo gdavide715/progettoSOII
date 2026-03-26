@@ -12,7 +12,7 @@
 
 // Quante iterazioni di riposo prima di considerarsi "riposato"
 // Calibra in base alla velocità: più speed è alto, più iterazioni passano in fretta
-#define REST_THRESHOLD 2000
+#define REST_THRESHOLD 500
 
 int instance_running = 0;
 
@@ -95,6 +95,7 @@ void worker_reputation(thread_args_t *a) {
             } else if (a->lavagna->cook == -1 && can_work(a, ROLE_COOK)) {
                 // La cucina è libera e lei è riposata: torna a cucinare
                 a->lavagna->cook = a->id;
+                break;
             }
             // Se cook != -1 e != a->id, qualcun altro sta cucinando (fallback):
             // Giulia non interferisce, aspetta e incrementa il rest_counter naturalmente
@@ -220,47 +221,185 @@ static void worker_profit(thread_args_t *a) {
     int id = a->id;
     int n  = a->sala->tables_n;
 
+    // Leggi sempre la stanchezza prima di decidere
+    update_fatigue(a);
+
     toggle_blackboard(a->semid, -1);
 
-    /* Cassiere SEMPRE assegnato, come nella reputation */
-    if (a->lavagna->cashier == -1)
-        a->lavagna->cashier = id;
+    switch (id) {
 
-    /* Cuoco SEMPRE assegnato */
-    if (a->lavagna->cook == -1)
-        a->lavagna->cook = id;
+        // -------------------------------------------------------
+        // Giulia (0): Cassiera fissa + Helper + Waiter di emergenza
+        //   Cashier: 1 | Helper: 1 | Waiter: 1
+        //   Non cucina mai (Cook:0)
+        // -------------------------------------------------------
+        case 0:
+            // --- Cassiera (ruolo primario) ---
+            if (a->lavagna->cashier == id) {
+                if (!can_work(a, ROLE_CASHIER))
+                    a->lavagna->cashier = -1;   // troppo stanca, si de-assegna
+            } else if (a->lavagna->cashier == -1 && can_work(a, ROLE_CASHIER)) {
+                a->lavagna->cashier = id;        // si riassegna appena riposata
+            }
 
-    /* Consegna cibo pronto */
-    for (int i = 0; i < n; i++) {
-        if (a->cucina->food_ready[i] &&
-            a->lavagna->tables[i].waiter == -1) {
-            a->lavagna->tables[i].waiter = id;
+            // --- Helper: pulizia tavoli (secondario) ---
+            if (can_work(a, ROLE_HELPER)) {
+                for (int i = 0; i < n; i++) {
+                    if (a->sala->tables[i].state == TABLE_FREED &&
+                        a->lavagna->tables[i].cleaner == -1) {
+                        a->lavagna->tables[i].cleaner = id;
+                        break;
+                    }
+                }
+                // Lavapiatti solo se nessuno lo sta già facendo
+                if (a->cucina->dirty_plates != LVL_NONE &&
+                    a->lavagna->dishwasher == -1) {
+                    a->lavagna->dishwasher = id;
+                }
+            }
+
+            // --- Waiter di emergenza (solo se Sara E Giorgia sono stanche) ---
+            if (can_work(a, ROLE_WAITER)) {
+                // Consegna cibo pronto
+                for (int i = 0; i < n; i++) {
+                    if (a->cucina->food_ready[i] &&
+                        a->lavagna->tables[i].waiter == -1) {
+                        a->lavagna->tables[i].waiter = id;
+                        break;
+                    }
+                }
+                // Presa ordine
+                for (int i = 0; i < n; i++) {
+                    if (a->sala->tables[i].state == TABLE_TAKEN &&
+                        a->sala->tables[i].food_qty == LVL_NONE &&
+                        a->lavagna->tables[i].waiter == -1) {
+                        a->lavagna->tables[i].waiter = id;
+                        break;
+                    }
+                }
+            }
             break;
-        }
-    }
 
-    /* Prendi ordine */
-    for (int i = 0; i < n; i++) {
-        if (a->sala->tables[i].state == TABLE_TAKEN &&
-            a->sala->tables[i].food_qty == LVL_NONE &&
-            a->lavagna->tables[i].waiter == -1) {
-            a->lavagna->tables[i].waiter = id;
+        // -------------------------------------------------------
+        // Sara (1): Cameriera primaria + Cook fallback + Helper
+        //   Waiter: 2 | Cook: 1 | Helper: 1 | Resilience: 2
+        //   Cashier: 0 → non fa mai la cassiera
+        // -------------------------------------------------------
+        case 1:
+            // --- Waiter (ruolo primario, Waiter:2) ---
+            if (can_work(a, ROLE_WAITER)) {
+                // Consegna cibo (priorità massima: tavolo si libera prima)
+                for (int i = 0; i < n; i++) {
+                    if (a->cucina->food_ready[i] &&
+                        a->lavagna->tables[i].waiter == -1) {
+                        a->lavagna->tables[i].waiter = id;
+                        break;
+                    }
+                }
+                // Presa ordine
+                for (int i = 0; i < n; i++) {
+                    if (a->sala->tables[i].state == TABLE_TAKEN &&
+                        a->sala->tables[i].food_qty == LVL_NONE &&
+                        a->lavagna->tables[i].waiter == -1) {
+                        a->lavagna->tables[i].waiter = id;
+                        break;
+                    }
+                }
+            }
+
+            // --- Cook fallback (solo se Fabio è stanco) ---
+            if (a->lavagna->cook == -1 && can_work(a, ROLE_COOK)) {
+                a->lavagna->cook = id;
+            }
+
+            // --- Helper secondario ---
+            if (can_work(a, ROLE_HELPER)) {
+                for (int i = 0; i < n; i++) {
+                    if (a->sala->tables[i].state == TABLE_FREED &&
+                        a->lavagna->tables[i].cleaner == -1) {
+                        a->lavagna->tables[i].cleaner = id;
+                        break;
+                    }
+                }
+                if (a->cucina->dirty_plates != LVL_NONE &&
+                    a->lavagna->dishwasher == -1) {
+                    a->lavagna->dishwasher = id;
+                }
+            }
             break;
-        }
-    }
 
-    /* Pulizia tavoli */
-    for (int i = 0; i < n; i++) {
-        if (a->sala->tables[i].state == TABLE_FREED &&
-            a->lavagna->tables[i].cleaner == -1) {
-            a->lavagna->tables[i].cleaner = id;
+        // -------------------------------------------------------
+        // Fabio (2): Cuoco fisso + Cashier fallback + Helper
+        //   Cook: 1 | Cashier: 1 | Helper: 1 | Resilience: 2
+        // -------------------------------------------------------
+        case 2:
+            // --- Cook (ruolo primario, fisso come in reputation) ---
+            if (a->lavagna->cook == id) {
+                if (!can_work(a, ROLE_COOK))
+                    a->lavagna->cook = -1;       // stanco, si toglie
+            } else if (a->lavagna->cook == -1 && can_work(a, ROLE_COOK)) {
+                a->lavagna->cook = id;           // torna appena riposato
+            }
+
+            // --- Cashier fallback (solo se Giulia è stanca) ---
+            if (a->lavagna->cashier == -1 && can_work(a, ROLE_CASHIER)) {
+                a->lavagna->cashier = id;
+            }
+
+            // --- Helper secondario ---
+            if (can_work(a, ROLE_HELPER)) {
+                for (int i = 0; i < n; i++) {
+                    if (a->sala->tables[i].state == TABLE_FREED &&
+                        a->lavagna->tables[i].cleaner == -1) {
+                        a->lavagna->tables[i].cleaner = id;
+                        break;
+                    }
+                }
+                if (a->cucina->dirty_plates != LVL_NONE &&
+                    a->lavagna->dishwasher == -1) {
+                    a->lavagna->dishwasher = id;
+                }
+            }
             break;
-        }
-    }
 
-    /* Lavapiatti */
-    if (a->cucina->dirty_plates != LVL_NONE && a->lavagna->dishwasher == -1)
-        a->lavagna->dishwasher = id;
+        // -------------------------------------------------------
+        // Giorgia (3): Cameriera primaria + Cashier fallback
+        //   Waiter: 2 | Cashier: 1 | Cook: 1 | Helper: 0
+        //   Helper:0 → non pulisce mai i tavoli / non lava piatti
+        // -------------------------------------------------------
+        case 3:
+            // --- Waiter (ruolo primario, Waiter:2) ---
+            if (can_work(a, ROLE_WAITER)) {
+                // Consegna cibo
+                for (int i = 0; i < n; i++) {
+                    if (a->cucina->food_ready[i] &&
+                        a->lavagna->tables[i].waiter == -1) {
+                        a->lavagna->tables[i].waiter = id;
+                        break;
+                    }
+                }
+                // Presa ordine
+                for (int i = 0; i < n; i++) {
+                    if (a->sala->tables[i].state == TABLE_TAKEN &&
+                        a->sala->tables[i].food_qty == LVL_NONE &&
+                        a->lavagna->tables[i].waiter == -1) {
+                        a->lavagna->tables[i].waiter = id;
+                        break;
+                    }
+                }
+            }
+
+            // --- Cashier fallback (se Giulia E Fabio sono stanchi) ---
+            if (a->lavagna->cashier == -1 && can_work(a, ROLE_CASHIER)) {
+                a->lavagna->cashier = id;
+            }
+
+            // --- Cook di emergenza (ultima risorsa dopo Sara) ---
+            if (a->lavagna->cook == -1 && can_work(a, ROLE_COOK)) {
+                a->lavagna->cook = id;
+            }
+            break;
+    }
 
     toggle_blackboard(a->semid, 1);
 }
